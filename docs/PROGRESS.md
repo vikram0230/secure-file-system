@@ -5,16 +5,16 @@ Implementation plan for the FastAPI + erasure-coded distributed file service des
 Legend: `[ ]` not started · `[~]` in progress · `[x]` done, approved
 
 ## Stage 0 — Boilerplate & Project Scaffolding
-- [ ] Repo layout: `app/` (API service), `storage_node/` (shard-store service), `tests/`, `docs/`
-- [ ] `pyproject.toml`/`requirements.txt`, dependency set (FastAPI, uvicorn, SQLAlchemy, Alembic, `reedsolo`, `psycopg`, pytest, httpx)
-- [ ] Config loading (env vars: `SECRET_KEY`, DB URL, storage node URLs, shard scheme k/m)
-- [ ] `docker-compose.yml` simulating the 6-node fleet + Postgres locally
-- [ ] Base FastAPI app skeleton with health check endpoint
+- [x] Repo layout: `src/api_service/` (API service, layered: routers/db/schemas/services), `src/storage_node/` (shard-store service), `tests/unit/`, `tests/integration/`
+- [x] `pyproject.toml`, dependency set (FastAPI, uvicorn, SQLAlchemy, Alembic, `reedsolo`, `psycopg`, pytest, httpx)
+- [x] Config loading (`pydantic-settings`; `SECRET_KEY`/DB URL/storage node list are required, no hardcoded defaults)
+- [x] `docker-compose.yml` simulating the 6-node fleet + Postgres locally, secrets/endpoints via git-ignored `.env.docker` (not inlined in the compose file)
+- [x] Base FastAPI app skeleton with health check endpoint — verified both services boot and respond to `/healthz`
 
 ## Stage 1 — Metadata Layer
-- [ ] SQLAlchemy models: `users`, `files`, `storage_nodes`, `shards`, `audit_events`
-- [ ] Alembic migration setup + initial migration
-- [ ] DB session/connection management, seed script for local storage nodes
+- [x] SQLAlchemy models: `users`, `files`, `storage_nodes`, `shards`, `audit_events`
+- [x] Alembic migration setup + initial migration — applied against Postgres in docker-compose and verified all 5 tables + FKs created correctly
+- [x] DB session/connection management (`db/session.py`), seed script for local storage nodes (`scripts/seed_storage_nodes.py`) — verified it populates `storage_nodes` from `SFS_STORAGE_NODES`
 
 ## Stage 2 — Storage Node Service
 - [ ] Minimal FastAPI app exposing `PUT/GET/DELETE /shards/{shard_id}`
