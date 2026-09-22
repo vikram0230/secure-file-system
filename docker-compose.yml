@@ -1,13 +1,22 @@
+# Local development stack. All secrets come from .env (see .env.example);
+# each service receives only the variables it needs. Hostnames below are
+# compose service names on the internal network, not deployment endpoints.
+
 x-storage-node: &storage-node
   build:
     context: .
     dockerfile: Dockerfile.storage_node
-  env_file: .env.docker
+  environment:
+    SFS_NODE_SHARD_DIR: /data
+    SFS_NODE_TOKEN: ${SFS_NODE_TOKEN:?set SFS_NODE_TOKEN in .env}
 
 services:
   postgres:
     image: postgres:16-alpine
-    env_file: .env.docker
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
     ports:
       - "5432:5432"
     volumes:
@@ -43,28 +52,56 @@ services:
     volumes: [node-6-data:/data]
     ports: ["9006:8000"]
 
+  # One-shot: apply migrations and register the storage nodes, then exit.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    command: ["sh", "-c", "alembic upgrade head && python scripts/seed_storage_nodes.py"]
+    environment:
+      SFS_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      SFS_STORAGE_NODES: storage-node-1:8000,storage-node-2:8000,storage-node-3:8000,storage-node-4:8000,storage-node-5:8000,storage-node-6:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+
   api:
     build:
       context: .
       dockerfile: Dockerfile.api
-    env_file: .env.docker
-    depends_on:
-      postgres:
-        condition: service_healthy
+    environment: &api-environment
+      SFS_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      SFS_SECRET_KEY: ${SFS_SECRET_KEY:?set SFS_SECRET_KEY in .env}
+      SFS_NODE_TOKEN: ${SFS_NODE_TOKEN:?set SFS_NODE_TOKEN in .env}
+    depends_on: &api-depends-on
+      migrate:
+        condition: service_completed_successfully
       storage-node-1:
-        condition: service_started
+        condition: service_healthy
       storage-node-2:
-        condition: service_started
+        condition: service_healthy
       storage-node-3:
-        condition: service_started
+        condition: service_healthy
       storage-node-4:
-        condition: service_started
+        condition: service_healthy
       storage-node-5:
-        condition: service_started
+        condition: service_healthy
       storage-node-6:
-        condition: service_started
+        condition: service_healthy
     ports:
       - "8000:8000"
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    command: ["python", "-m", "api_service.worker"]
+    environment: *api-environment
+    depends_on: *api-depends-on
+    healthcheck:
+      disable: true
 
 volumes:
   pg-data:
