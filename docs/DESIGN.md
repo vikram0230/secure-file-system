@@ -1,97 +1,120 @@
 # System Design: Distributed Secure File Sharing Service (DigitalOcean, Erasure-Coded)
 
-## 1. Goals & Scope
+> Incorporates the structure and edge-case analysis from `docs/Signed File Vault.html` (an earlier baseline design captured for this project), extended so that the erasure-coded, multi-node architecture is the **actual build target** for this exercise — not a future-only reference. Python is the implementation language.
 
-Build a REST API service, deployed on DigitalOcean, that:
+## 1. Scope & Requirements
 
-- Ingests private files from users and stores them **redundantly across multiple storage nodes** using **erasure coding** rather than full replication.
-- Issues **cryptographically signed, time-limited download URLs** that remain verifiable across service restarts (stateless signature scheme).
-- Serves files after validating the signature/expiry, reconstructing the file from surviving shards if some nodes are unavailable.
-- Tracks file metadata (owner, filename, size, upload date, shard placement) and audit events (every signed-link issuance and every download).
+A REST service that lets a user upload private files, stores them redundantly on the local file system of a small storage-node fleet (never in a public object store), and issues time-limited, cryptographically signed download links. Requirements, taken from the brief:
 
-Non-goals (out of scope for this iteration): multi-region geo-replication, client-side encryption/key management, resumable/multipart uploads, real-time collaboration.
+| # | Requirement | Where addressed |
+|---|---|---|
+| 1 | Secure ingestion — non-public directory, file associated with a user ID | §3 (Upload), §6 (storage nodes never publicly reachable) |
+| 2 | Signer endpoint — file ID + TTL → signed URL that survives a restart | §4 (Signed URL Design) |
+| 3 | Public retrieval endpoint — validates signature + expiry, serves file | §3 (Download) |
+| 4 | Owner metadata query — filename, size, upload date, status | §2 data model (`files` table), API surface |
+| 5 | Audit event on every signed-link generation | §4, `audit_events` table |
+| 6 | Architecture flow diagram in the repo | §3 |
+| 7 | Validation, error handling, edge cases | §5 |
+| 8 | Tests, CI/CD, documentation | implementation phase, not this doc |
+| 9 (this project's added constraint) | Distributed storage with erasure-coded redundancy | §6, §7 |
 
-## 2. Why Erasure Coding
+The redundancy requirement changes what "non-public directory on the local file system" means: instead of one directory on one Droplet, the file is split into shards and each shard lives in a non-public directory on a different storage node. Ownership, the local-disk storage model, and the audit/signing contract are unchanged from a single-node design — only *where* the bytes live and how they're reassembled differs.
 
-Pure N-way replication costs `N×` storage for tolerance of `N-1` node failures. Reed-Solomon erasure coding with `k` data shards and `m` parity shards tolerates any `m` shard losses at only `(k+m)/k×` storage overhead.
+## 2. Data Model (Postgres)
 
-**Chosen scheme: Reed-Solomon 4+2** (`k=4` data shards, `m=2` parity shards, 6 shards total per file).
+```sql
+CREATE TABLE users (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email         TEXT UNIQUE NOT NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
-- Storage overhead: 1.5× (vs. 3× for 3-way replication).
-- Fault tolerance: any 2 of 6 storage nodes can be down/lost and the file is still reconstructable.
-- Library: `reedsolo` (pure Python, no C toolchain dependency — simplest to build, test, and containerize in the timeframe; can be swapped for `pyeclib`/`liberasurecode` later if throughput on large files becomes a bottleneck).
-- Shard placement: each of the 6 shards is written to a **different storage node** so that a single node failure only ever costs one shard.
+CREATE TABLE files (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_user_id   UUID NOT NULL REFERENCES users(id),
+  original_name   TEXT NOT NULL,
+  content_type    TEXT NOT NULL,
+  size_bytes      BIGINT NOT NULL,
+  checksum_sha256 TEXT NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'uploading', -- uploading | available | degraded | deleted
+  uploaded_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at      TIMESTAMPTZ
+);
+CREATE INDEX idx_files_owner ON files(owner_user_id);
 
-Small files still get split into 6 shards (padding as needed) to keep the placement and reconstruction logic uniform; a future optimization could skip EC below a size threshold and just replicate.
+CREATE TABLE storage_nodes (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  hostname      TEXT NOT NULL,
+  private_ip    INET NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'healthy' -- healthy | unreachable | decommissioned
+);
 
-## 3. High-Level Architecture
+CREATE TABLE shards (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  file_id         UUID NOT NULL REFERENCES files(id),
+  shard_index     SMALLINT NOT NULL,      -- 0-5 for a 4+2 scheme
+  kind            TEXT NOT NULL,          -- data | parity
+  node_id         UUID NOT NULL REFERENCES storage_nodes(id),
+  checksum_sha256 TEXT NOT NULL,
+  size_bytes      BIGINT NOT NULL,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_shards_file ON shards(file_id);
+
+CREATE TABLE audit_events (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  file_id         UUID NOT NULL REFERENCES files(id),
+  actor_user_id   UUID REFERENCES users(id),
+  event_type      TEXT NOT NULL, -- link_generated | download_success | download_denied | file_uploaded
+  ttl_seconds     INT,
+  ip_address      INET,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_audit_file ON audit_events(file_id);
+```
+
+The signed token itself is never persisted — it is stateless by construction (§4). `shards` is the only addition versus a single-node design; everything else is the same schema a non-distributed version would use.
+
+## 3. Architecture & Request Flow
 
 ```mermaid
 flowchart LR
-    subgraph Client
-        U[User]
-    end
-
-    subgraph "DO Load Balancer"
-        LB[Load Balancer / TLS termination]
-    end
-
-    subgraph "API Layer (DO App Platform / Droplet pool, private VPC)"
-        API[FastAPI Service<br/>- Auth<br/>- Upload orchestration<br/>- Erasure encode/decode<br/>- Signed URL issue/verify<br/>- Metadata & audit]
-    end
-
-    subgraph "Metadata Store"
-        DB[(DO Managed Postgres<br/>files, shards, audit_log, users)]
-    end
-
-    subgraph "Storage Node Fleet (private VPC, 6+ Droplets)"
-        N1[(Node 1<br/>DO Volume)]
-        N2[(Node 2<br/>DO Volume)]
-        N3[(Node 3<br/>DO Volume)]
-        N4[(Node 4<br/>DO Volume)]
-        N5[(Node 5<br/>DO Volume)]
-        N6[(Node 6<br/>DO Volume)]
-    end
-
-    U -->|HTTPS| LB --> API
-    API <-->|SQL| DB
-    API <-->|shard PUT/GET, internal HTTP, VPC-only| N1
-    API <-->|shard PUT/GET| N2
-    API <-->|shard PUT/GET| N3
-    API <-->|shard PUT/GET| N4
-    API <-->|shard PUT/GET| N5
-    API <-->|shard PUT/GET| N6
+    U[User] -->|HTTPS| LB[DO Load Balancer<br/>TLS termination]
+    LB --> API[API Service (FastAPI/Python)<br/>auth, encode/decode, sign/verify, audit]
+    API <-->|SQL| DB[(DO Managed Postgres<br/>files, shards, audit_events)]
+    API <-->|shard PUT/GET, private VPC only| N1[(Node 1<br/>DO Volume)]
+    API <--> N2[(Node 2)]
+    API <--> N3[(Node 3)]
+    API <--> N4[(Node 4)]
+    API <--> N5[(Node 5)]
+    API <--> N6[(Node 6)]
 ```
 
-Storage nodes are only reachable inside the DigitalOcean VPC — never exposed publicly. All file bytes enter/leave the system through the API layer, which is the only public surface.
+Storage nodes are plain services (Python, e.g. Flask/FastAPI) that expose `PUT/GET/DELETE /shards/{shard_id}` writing to a **non-public directory** on local disk — the same "local file system, outside the web root, UUID-named" pattern as a single-node baseline, just replicated onto 6 hosts instead of 1. They are never reachable from outside the DO VPC; the API service is the only public surface.
 
-## 4. Request Lifecycles
-
-### 4.1 Upload
+### Upload
 
 ```mermaid
 sequenceDiagram
     participant U as User
     participant API as API Service
-    participant EC as Erasure Encoder (in-process)
     participant N as Storage Nodes (1..6)
     participant DB as Metadata DB
 
-    U->>API: POST /files (multipart upload, auth token)
+    U->>API: POST /files (multipart, auth token)
     API->>API: validate auth, content-type, size limit
-    API->>EC: split file into 4 data + 2 parity shards
+    API->>API: split file into 4 data + 2 parity shards (Reed-Solomon)
     par write shards in parallel
-        EC->>N: PUT shard 1..6 (one per node)
+        API->>N: PUT shard 1..6 (one per node, non-public dir)
     end
-    API->>DB: INSERT file row (owner, filename, size, checksum, status)
-    API->>DB: INSERT shard rows (file_id, shard_index, node_id, shard_checksum)
+    API->>DB: INSERT files row (status='uploading' -> 'available')
+    API->>DB: INSERT shards rows, INSERT audit_events(file_uploaded)
     API-->>U: 201 Created { file_id }
 ```
 
-- Each shard is checksummed (SHA-256) before write and verified on write-ack.
-- The file row is only marked `available` once all 6 shard writes are acknowledged; a partial-failure path deletes any written shards and returns `502`.
+If any shard write fails, the API deletes the shards that did succeed and returns `502` — partial uploads are never left half-written (`status` never reaches `available` unless all 6 acks succeed).
 
-### 4.2 Signed URL Generation
+### Signed URL Generation
 
 ```mermaid
 sequenceDiagram
@@ -100,16 +123,13 @@ sequenceDiagram
     participant DB as Metadata DB
 
     U->>API: POST /files/{file_id}/sign { ttl_seconds }
-    API->>API: verify caller owns file_id
-    API->>API: build payload = file_id + expires_at + nonce
-    API->>API: signature = HMAC-SHA256(server_secret, payload)
-    API->>DB: INSERT audit_log(event=LINK_ISSUED, file_id, user_id, expires_at)
-    API-->>U: 200 { url: "/download?fid=..&exp=..&nonce=..&sig=.." }
+    API->>DB: verify caller owns file_id
+    API->>API: sig = HMAC-SHA256(SECRET_KEY, file_id + expires_at)
+    API->>DB: INSERT audit_events(link_generated, ttl_seconds)
+    API-->>U: 200 { url: "/download?fileId=..&expires=..&sig=.." }
 ```
 
-The signature is **stateless**: `sig = HMAC-SHA256(SECRET_KEY, file_id | expires_at | nonce)`. Validity depends only on the server holding `SECRET_KEY` (loaded from an environment secret, not generated at process start), so a restart does not invalidate outstanding links. `SECRET_KEY` is rotated via a versioned key ID prefixed into the token (`kid.payload.sig`) so old links keep validating during rotation.
-
-### 4.3 Download / Retrieval (public endpoint)
+### Download / Retrieval (public endpoint)
 
 ```mermaid
 sequenceDiagram
@@ -117,77 +137,91 @@ sequenceDiagram
     participant API as API Service
     participant DB as Metadata DB
     participant N as Storage Nodes
-    participant EC as Erasure Decoder
 
-    U->>API: GET /download?fid=..&exp=..&nonce=..&sig=..
-    API->>API: recompute HMAC, constant-time compare, check exp > now
+    U->>API: GET /download?fileId=..&expires=..&sig=..
+    API->>API: recompute HMAC, constant-time compare, check expires > now
     alt invalid or expired
+        API->>DB: INSERT audit_events(download_denied)
         API-->>U: 403 Forbidden
     else valid
         API->>DB: SELECT shard locations for file_id
         API->>N: GET any 4 of 6 shards (parallel, first-4-wins)
-        N-->>API: shard bytes
-        API->>EC: reconstruct original file from 4 shards
-        API->>DB: INSERT audit_log(event=FILE_DOWNLOADED, file_id, ip, ts)
+        API->>API: Reed-Solomon decode -> original bytes
+        API->>DB: INSERT audit_events(download_success)
         API-->>U: 200 stream file bytes
     end
 ```
 
-- Fetching "any 4 of 6" (rather than always the same 4) means the system tolerates up to 2 simultaneous node outages with no special-casing.
-- Reconstruction happens in-memory/streamed in the API process; no shard ever touches a public-facing disk.
+Fetching "any 4 of 6" (not always the same 4) is what makes 1–2 node outages transparent to the client — no special-casing which node is down.
 
-### 4.4 Metadata Query
+## 4. Signed URL Design
 
-`GET /files` and `GET /files/{file_id}` return owner-scoped metadata (filename, size, upload timestamp, status, shard health summary) directly from Postgres — no shard I/O required.
-
-## 5. Data Model (Postgres)
+The restart-survival requirement is about the **signature**, not the storage. An in-memory token map (`{token: {fileId, expiresAt}}`) is ruled out because a restart clears it and every previously issued link would 404 even though the shards are untouched on disk.
 
 ```
-users(id, email, created_at)
-files(id, owner_id, filename, content_type, size_bytes, checksum_sha256,
-      status ENUM('uploading','available','degraded','deleted'),
-      created_at)
-shards(id, file_id, shard_index (0-5), kind ENUM('data','parity'),
-       node_id, checksum_sha256, size_bytes, created_at)
-storage_nodes(id, hostname, private_ip, capacity_bytes, status ENUM('healthy','unreachable','decommissioned'))
-audit_log(id, event ENUM('LINK_ISSUED','FILE_DOWNLOADED','FILE_UPLOADED','FILE_DELETED'),
-          file_id, user_id, ip_address, metadata JSONB, created_at)
+GET /download?fileId=<id>&expires=<unix_ts>&sig=<hmac>
+
+sig = HMAC-SHA256(SECRET_KEY, fileId + expires)
 ```
 
-`status='degraded'` marks a file that has lost shards beyond a repair threshold's early warning (1 shard down); a background job re-encodes and re-places the missing shard onto a healthy node once fewer than `m` shards remain, before data loss becomes irreversible.
+- `SECRET_KEY` is long-lived config (DO App Platform encrypted env var), identical before and after a restart — never generated at process boot.
+- Validation recomputes the HMAC from the query params and does a constant-time comparison (`hmac.compare_digest`); no DB or in-memory lookup is needed to check signature validity or expiry.
+- A DB lookup by `fileId` is still required to resolve shard locations and to write the audit row — that's independent of the signature check itself.
+- Key rotation: prefix a key ID (`kid.fileId.expires.sig`) so old links keep validating while a new secret rolls out.
+- This mirrors how S3/Spaces presigned URLs work: self-contained signature against a fixed secret, no server-side session required.
 
-## 6. DigitalOcean Deployment Topology
+## 5. Edge Cases & Failure Modes
+
+| Scenario | Risk | Mitigation |
+|---|---|---|
+| Client-supplied filename used as storage path | path traversal | Store by server-generated UUID + shard index; original filename kept only as metadata for `Content-Disposition`. |
+| API process restarts | links break if tokens are looked up in memory | Stateless HMAC signature keyed off a persistent secret — no in-memory token table. |
+| 1–2 storage nodes down or a disk lost entirely | data loss risk on a single node | Reed-Solomon 4+2: any 4 of 6 shards reconstruct the file; tolerates 2 simultaneous node losses (§7). |
+| More than 2 nodes down for one file | file temporarily unreconstructable | `files.status` flips to `degraded`; surfaced via metadata API and alerting rather than silently failing. |
+| Per-user storage quota checked then written across concurrent requests | TOCTOU race | Atomic DB update (`UPDATE ... SET used = used + size WHERE used + size <= limit`) or row lock, never app-level check-then-write. |
+| Concurrent audit-event/metadata inserts across API instances | none — independent rows | No special handling required; Postgres row-level atomicity covers it. |
+| Silent disk corruption / bit rot on one node | undetected corruption | Per-shard SHA-256 checksum stored at write time and verified on every read; a background scrub job detects mismatches and triggers repair (§7). |
+| Metadata DB unavailable | could serve unaudited/unauthenticated downloads | Service fails closed (503) rather than skipping the ownership/audit path. |
+| Swapping to native Spaces/S3 presigned URLs | bypasses ownership check + audit log | If ever adopted, ownership check and audit write must stay in the app before generating any link; stream through the app rather than redirecting to a native presigned URL. |
+
+## 6. Deployment Topology (DigitalOcean)
 
 | Component | DO Resource |
 |---|---|
 | Public entrypoint | DO Load Balancer (TLS termination, health checks) |
-| API service | DO App Platform (or a Droplet pool in an Autoscaling Group) running the FastAPI app in a private VPC |
-| Storage nodes | 6+ Droplets, one per shard slot (plus spares for repair targets), each with an attached DO Volume for shard blobs; reachable only inside the VPC |
-| Metadata DB | DO Managed PostgreSQL (automated backups, connection pooling via PgBouncer) |
-| Secrets (HMAC key, DB creds) | DO App Platform encrypted environment variables |
-| Observability | DO Monitoring/alerts on node disk + API latency; structured JSON logs shipped to a log sink |
+| API service | DO App Platform or a Droplet pool in an autoscaling group, private VPC |
+| Storage nodes | 6+ Droplets (one per shard slot, plus spares), each with an attached DO Volume; **no public IP** |
+| Metadata DB | DO Managed PostgreSQL, automated backups, PgBouncer pooling |
+| Secrets (`SECRET_KEY`, DB creds) | DO App Platform encrypted environment variables |
+| Observability | DO Monitoring on node disk + API latency; structured JSON logs to a log sink |
 
-Everything except the load balancer and API service lives in a private VPC with no public IP, so storage nodes and the database are unreachable from the internet.
+Everything except the load balancer and API service sits in a private VPC with no public IP — storage nodes and the database are unreachable from the internet, satisfying "non-public directory" at the network level as well as the filesystem level.
 
-## 7. Security Considerations
+## 7. Redundancy: Erasure-Coded Storage (build target, not future-only)
 
-- **Non-public storage**: shard files are named by opaque UUID + shard index, stored outside any web-served directory, on private-VPC-only nodes.
-- **Signed URLs**: HMAC-SHA256, constant-time comparison, mandatory expiry, single-use nonce optionally tracked in Postgres to prevent replay if required by the reviewer's threat model.
-- **AuthN/Z**: bearer-token auth for upload/sign/metadata endpoints; ownership check before signing or viewing metadata for a file.
-- **Transport security**: TLS terminated at the load balancer; internal API↔node traffic stays inside the DO VPC (can add mTLS between API and storage nodes as a hardening follow-up).
-- **Input validation**: file size cap, content-type allow/deny list, filename sanitization, TTL bounds on signed URLs (e.g., 60s–7 days).
+Reed-Solomon **4+2** (`k=4` data shards, `m=2` parity shards, 6 total per file):
 
-## 8. Failure Modes & Tolerance
+- Storage overhead: 1.5× (vs. 3× for 3-way replication).
+- Fault tolerance: any 2 of 6 storage nodes can be down or lost and the file is still reconstructable.
+- Library: `reedsolo` (pure Python, no C toolchain dependency — fastest to build/test/containerize for this exercise; a production follow-up could swap in `pyeclib`/`liberasurecode` for higher throughput).
+- Placement: each of the 6 shards for a given file is written to a **different** storage node so a single node failure costs exactly one shard.
 
-| Failure | Behavior |
-|---|---|
-| 1–2 storage nodes down | Reads succeed (reconstruct from remaining shards); writes to a down node fail fast and the upload is retried against a spare node |
-| >2 storage nodes down for one file | File marked `degraded`/unavailable until nodes recover; no silent data loss because it's surfaced via `status` and alerting |
-| API process restart | Signed URLs remain valid (HMAC is stateless); in-flight uploads are rolled back (partial shards cleaned up) |
-| Metadata DB unavailable | Service fails closed (503) rather than serving unauthenticated/unaudited downloads |
+**Upload**: file → 4 data shards + 2 parity shards (computed with `reedsolo`) → one shard PUT per node → metadata DB records `{shard_index → node_id, checksum}` per shard.
 
-## 9. Open Items for Implementation
+**Download**: signature/expiry validated exactly as in §4 (unchanged by the distributed layer) → fetch any 4 of the 6 shards → Reed-Solomon decode → stream reconstructed bytes → audit event recorded.
 
-- Confirm nonce single-use policy (stateless vs. tracked) with the reviewer's expected threat model.
-- Decide background repair job scheduling (cron vs. event-driven on node health-check failure).
-- Load-test shard fan-out concurrency limits per API instance.
+**Repair**: a background job periodically verifies shard checksums, detects missing/corrupt shards or dead nodes, reconstructs them from the remaining 4, and rewrites them to a healthy node, updating the metadata pointers. This is what actually delivers durability — data survives node loss because it is *reconstructable*, not because any one node is specially protected.
+
+Scoped honestly for this exercise: the coordinator (encode/place on upload, fetch-any-4/decode on download) and a basic checksum-verify-and-reconstruct repair job are what get built. A production-grade version would add write quorums, split-brain handling, and automatic rebalancing on node join/leave — real systems work beyond this exercise's scope, called out explicitly rather than silently skipped.
+
+## 8. Alternatives Considered
+
+- **DigitalOcean Spaces (S3-compatible)**: has native presigned URLs (stateless, restart-safe) but no concept of file ownership, no audit hook, and no erasure-coding control — DO already replicates internally but that's opaque redundancy, not something we can demonstrate as "erasure coding for redundancy." Not chosen because the objective is to build and show the distributed/erasure-coded design, not depend on a managed object store's internals.
+- **Self-hosted MinIO (erasure-coded mode)**: gets Reed-Solomon, self-healing, and an S3-compatible API running on DO Droplets without hand-building the coordinator/repair logic. This is the pragmatic production choice, but it would replace the custom implementation this exercise is meant to demonstrate, so it's noted here as the recommended real-world path rather than adopted for the deliverable.
+- **Single-node baseline (local disk, no erasure coding)**: simplest, satisfies the literal brief, but does not satisfy this project's explicit "distributed file system, use erasure coding for redundancy" requirement — superseded by §6/§7 as the actual build target.
+
+## 9. Recommendation & Phasing
+
+1. **This exercise (build target):** the erasure-coded, multi-node architecture in §3/§6/§7 — Python API service, 6-node storage fleet (can run as 6 local processes/containers for dev, real Droplets for the DO deployment), Postgres metadata + audit, stateless HMAC signed URLs.
+2. **Production hardening (not built here, documented as follow-up):** write quorums / split-brain handling in the repair service, automatic rebalancing on node join/leave, mTLS between API and storage nodes.
+3. **Longer-term alternative:** migrate to self-hosted MinIO (erasure-coded mode) or DO Spaces if operating a hand-rolled coordinator/repair service becomes more overhead than it's worth at scale — treat §7 as the reference for *how* erasure-coded durability works even after such a migration.
