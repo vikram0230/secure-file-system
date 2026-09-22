@@ -6,16 +6,16 @@ build-backend = "setuptools.build_meta"
 name = "secure-file-system"
 version = "0.1.0"
 description = "Distributed, erasure-coded secure file sharing service"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
-    "sqlalchemy>=2.0",
+    "sqlalchemy[asyncio]>=2.0",
     "alembic>=1.13",
     "psycopg[binary]>=3.1",
-    "reedsolo>=1.7",
+    "zfec>=1.6",
     "httpx>=0.27",
     "python-multipart>=0.0.9",
 ]
@@ -33,7 +33,16 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.ruff]
 line-length = 100
 src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Alembic-generated revisions: keep them as generated rather than hand-wrapping.
+"migrations/versions/*" = ["E501"]
