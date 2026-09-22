@@ -1,0 +1,10 @@
+.env
+.env.docker
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.DS_Store
+docs/Signed File Vault.html

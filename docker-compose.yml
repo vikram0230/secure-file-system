@@ -1,0 +1,76 @@
+x-storage-node: &storage-node
+  build:
+    context: .
+    dockerfile: Dockerfile.storage_node
+  env_file: .env.docker
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    env_file: .env.docker
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  storage-node-1:
+    <<: *storage-node
+    volumes: [node-1-data:/data]
+    ports: ["9001:8000"]
+  storage-node-2:
+    <<: *storage-node
+    volumes: [node-2-data:/data]
+    ports: ["9002:8000"]
+  storage-node-3:
+    <<: *storage-node
+    volumes: [node-3-data:/data]
+    ports: ["9003:8000"]
+  storage-node-4:
+    <<: *storage-node
+    volumes: [node-4-data:/data]
+    ports: ["9004:8000"]
+  storage-node-5:
+    <<: *storage-node
+    volumes: [node-5-data:/data]
+    ports: ["9005:8000"]
+  storage-node-6:
+    <<: *storage-node
+    volumes: [node-6-data:/data]
+    ports: ["9006:8000"]
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    env_file: .env.docker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      storage-node-1:
+        condition: service_started
+      storage-node-2:
+        condition: service_started
+      storage-node-3:
+        condition: service_started
+      storage-node-4:
+        condition: service_started
+      storage-node-5:
+        condition: service_started
+      storage-node-6:
+        condition: service_started
+    ports:
+      - "8000:8000"
+
+volumes:
+  pg-data:
+  node-1-data:
+  node-2-data:
+  node-3-data:
+  node-4-data:
+  node-5-data:
+  node-6-data:
